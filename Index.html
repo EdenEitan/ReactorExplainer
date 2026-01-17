@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reactor Pattern Explainer - Eden Eitan</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;700&family=Rubik:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        body { font-family: 'Heebo', sans-serif; background-color: #f8fafc; }
+        .font-heading { font-family: 'Rubik', sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-in { animation: fadeIn 0.4s ease-out forwards; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect, useRef } = React;
+
+        const Icons = {
+            Heart: (props) => <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>,
+            Eye: (props) => <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>,
+            Cpu: (props) => <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/></svg>,
+            Layers: (props) => <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/></svg>,
+            Code: (props) => <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>,
+            Info: (props) => <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>,
+            Play: (props) => <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        };
+
+        // --- DATA (EXACTLY AS IN PDF) ---
+
+        const reactorData = {
+            title: "Reactor.java",
+            code: `public class Reactor<T> implements Runnable {
+    private final int port;
+    private final Supplier<MessagingProtocol<T>> protocolFactory;
+    private final Supplier<MessageEncoderDecoder<T>> readerFactory;
+    private final ActorThreadPool<NonBlockingConnectionHandler<T>> pool;
+    private Selector selector;
+    private Thread selectorThread;
+    private final ConcurrentLinkedQueue<Runnable> selectorTasks = new ConcurrentLinkedQueue<>();
+
+    public Reactor(int numThreads, int port, Supplier<MessagingProtocol<T>> protocolFactory, Supplier<MessageEncoderDecoder<T>> readerFactory) {
+        this.pool = new ActorThreadPool<>(numThreads);
+        this.port = port;
+        this.protocolFactory = protocolFactory;
+        this.readerFactory = readerFactory;
+    }
+
+    @Override public void run() { serve(); }
+
+    public void serve() {
+        selectorThread = Thread.currentThread();
+        try (Selector selector = Selector.open();
+             ServerSocketChannel serverSock = ServerSocketChannel.open()) {
+            this.selector = selector;
+            serverSock.bind(new InetSocketAddress(port));
+            serverSock.configureBlocking(false);
+            serverSock.register(selector, SelectionKey.OP_ACCEPT);
+
+            while (!selectorThread.isInterrupted()) {
+                selector.select();
+                runSelectionThreadTasks();
+                for (SelectionKey key : selector.selectedKeys()) {
+                    if (!key.isValid()) continue;
+                    else if (key.isAcceptable()) handleAccept(serverSock, selector);
+                    else handleReadWrite(key);
+                }
+                selector.selectedKeys().clear();
+            }
+        } catch (IOException ex) { ex.printStackTrace(); }
+        pool.shutdown();
+    }
+
+    void updateInterestedOps(SocketChannel chan, int ops) {
+        final SelectionKey key = chan.keyFor(selector);
+        if (Thread.currentThread() == selectorThread) {
+            key.interestOps(ops);
+        } else {
+            selectorTasks.add(() -> { if(key.isValid()) key.interestOps(ops); });
+            selector.wakeup();
+        }
+    }
+
+    private void handleAccept(ServerSocketChannel serverChan, Selector selector) throws IOException {
+        SocketChannel clientChan = serverChan.accept();
+        clientChan.configureBlocking(false);
+        final NonBlockingConnectionHandler handler = new NonBlockingConnectionHandler(readerFactory.get(), protocolFactory.get(), clientChan, this);
+        clientChan.register(selector, SelectionKey.OP_READ, handler);
+    }
+
+    private void handleReadWrite(SelectionKey key) {
+        NonBlockingConnectionHandler handler = (NonBlockingConnectionHandler) key.attachment();
+        if (key.isReadable()) {
+            Runnable task = handler.continueRead();
+            if (task != null) pool.submit(handler, task);
+        }
+        if (key.isWritable()) handler.continueWrite();
+    }
+
+    private void runSelectionThreadTasks() {
+        while (!selectorTasks.isEmpty()) selectorTasks.remove().run();
+    }
+}`,
+            comments: {
+                19: "serve(): לב הריאקטור. הלולאה הראשית שמנהלת את הכל[cite: 19].",
+                20: "selectorThread: שמירת ה-Thread שבו רץ ה-Event Loop. משמש ב-updateInterestedOps כדי לוודא שרק ה-Selector ניגש לעצמו[cite: 20].",
+                21: "Selector.open(): פתיחת הרכיב של מערכת ההפעלה שמנהל את ה-I/O הלא-חוסם[cite: 21].",
+                25: "serverSock.bind: קישור השרת לפורט המאזין[cite: 24].",
+                26: "configureBlocking(false): הפעולה הכי חשובה! הפיכת הסוקט ללא-חוסם כדי שהשרת יוכל לטפל באלפי לקוחות ב-Thread אחד[cite: 25].",
+                27: "register(OP_ACCEPT): רישום ראשוני - אנחנו מודיעים לסלקטור שמעניין אותנו כרגע רק קבלת לקוחות חדשים[cite: 26].",
+                30: "selector.select(): כאן הריאקטור עוצר ומחכה לאירועים. זו הפעולה החוסמת היחידה[cite: 28].",
+                31: "runSelectionThreadTasks(): ביצוע משימות ניהוליות שהצטברו בתור (כמו שינוי interestOps מ-Threads אחרים)[cite: 30].",
+                42: "selectedKeys().clear(): חובה לנקות את הסט בסוף הטיפול, אחרת בסיבוב הבא נטפל שוב באותם אירועים שכבר הסתיימו[cite: 42].",
+                53: "updateInterestedOps: שיטה קריטית. אם אנחנו לא ב-Selector Thread, מוסיפים למשימות וקוראים ל-wakeup כדי להעיר את הסלקטור מה-select [cite: 53-60].",
+                81: "handleAccept: קבלת לקוח, הפיכתו ל-NonBlocking ויצירת Handler אישי עבורו [cite: 63-74].",
+                92: "handleReadWrite: פיצול האירועים - READ נשלח ל-ThreadPool, ו-WRITE מבוצע מיידית [cite: 75-88]."
+            }
+        };
+
+        const handlerData = {
+            title: "Handler.java",
+            code: `public class NonBlockingConnectionHandler<T> {
+    private static final int BUFFER_ALLOCATION_SIZE = 1 << 13; //8k
+    private static final ConcurrentLinkedQueue<ByteBuffer> BUFFER_POOL = new ConcurrentLinkedQueue<>();
+    private final MessagingProtocol<T> protocol;
+    private final MessageEncoderDecoder<T> encdec;
+    private final Queue<ByteBuffer> writeQueue = new ConcurrentLinkedQueue<>();
+    private final SocketChannel chan;
+    private final Reactor reactor;
+
+    public Runnable continueRead() {
+        ByteBuffer buf = leaseBuffer();
+        boolean success = false;
+        try { success = chan.read(buf) != -1; }
+        catch (IOException ex) { ex.printStackTrace(); }
+        if (success) {
+            buf.flip();
+            return () -> {
+                try {
+                    while (buf.hasRemaining()) {
+                        T nextMessage = encdec.decodeNextByte(buf.get());
+                        if (nextMessage != null) {
+                            T response = protocol.process(nextMessage);
+                            if (response != null) {
+                                writeQueue.add(ByteBuffer.wrap(encdec.encode(response)));
+                                reactor.updateInterestedOps(chan, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+                            }
+                        }
+                    }
+                } finally { releaseBuffer(buf); }
+            };
+        } else { releaseBuffer(buf); close(); return null; }
+    }
+
+    public void continueWrite() {
+        while (!writeQueue.isEmpty()) {
+            ByteBuffer top = writeQueue.peek();
+            try {
+                chan.write(top);
+                if (top.hasRemaining()) return;
+                else writeQueue.remove();
+            } catch (IOException ex) { ex.printStackTrace(); close(); }
+        }
+        if (writeQueue.isEmpty()) {
+            if (protocol.shouldTerminate()) close();
+            else reactor.updateInterestedOps(chan, SelectionKey.OP_READ);
+        }
+    }
+    
+    private static ByteBuffer leaseBuffer() {
+        ByteBuffer buff = BUFFER_POOL.poll();
+        if (buff == null) return ByteBuffer.allocateDirect(BUFFER_ALLOCATION_SIZE);
+        buff.clear(); return buff;
+    }
+    private static void releaseBuffer(ByteBuffer buff) { BUFFER_POOL.add(buff); }
+}`,
+            comments: {
+                2: "גודל באפר של 8K לקריאה יעילה[cite: 98].",
+                3: "BUFFER_POOL: אופטימיזציה לזכרון - במקום ליצור באפרים חדשים, אנחנו ממחזרים אותם [cite: 99-100].",
+                11: "continueRead(): קריאה לא חוסמת מהסוקט לתוך הבאפר [cite: 115-120].",
+                16: "return () -> { ... }: שים לב! זה ה-Runnable שנשלח ל-ThreadPool. כאן קורה העיבוד [cite: 126-144].",
+                21: "protocol.process: ביצוע הלוגיקה העסקית של ההודעה[cite: 132].",
+                23: "updateInterestedOps: הוספת OP_WRITE כדי שהסלקטור יודיע לנו כשאפשר לשלוח את התשובה [cite: 136-137].",
+                37: "continueWrite(): שליחת הודעות מהתור ללקוח [cite: 158-163].",
+                41: "top.hasRemaining(): אם לא הצלחנו לכתוב הכל (באפר OS מלא), עוצרים ומחכים לאירוע WRITE הבא [cite: 163-165]."
+            }
+        };
+
+        const poolData = {
+            title: "ActorThreadPool.java",
+            code: `public class ActorThreadPool<T> {
+    private final Map<T, Queue<Runnable>> acts;
+    private final ReadWriteLock actsRWLock;
+    private final Set<T> playingNow;
+    private final ExecutorService threads;
+
+    public ActorThreadPool(int threads) {
+        this.threads = Executors.newFixedThreadPool(threads);
+        acts = new WeakHashMap<>();
+        playingNow = ConcurrentHashMap.newKeySet();
+        actsRWLock = new ReentrantReadWriteLock();
+    }
+
+    public void submit(T act, Runnable r) {
+        synchronized (act) {
+            if (!playingNow.contains(act)) {
+                playingNow.add(act);
+                execute(r, act);
+            } else {
+                pendingRunnablesOf(act).add(r);
+            }
+        }
+    }
+
+    private void execute(Runnable r, T act) {
+        threads.submit(() -> {
+            try { r.run(); }
+            finally { complete(act); }
+        });
+    }
+
+    private void complete(T act) {
+        synchronized (act) {
+            Queue<Runnable> pending = pendingRunnablesOf(act);
+            if (pending.isEmpty()) playingNow.remove(act);
+            else execute(pending.poll(), act);
+        }
+    }
+}`,
+            comments: {
+                8: "WeakHashMap: אם הלקוח מתנתק, הזכרון שלו במפה ישוחרר אוטומטית ע\"י ה-GC[cite: 198].",
+                13: "synchronized(act): נעילה על הלקוח הספציפי למניעת Race Conditions[cite: 199].",
+                14: "playingNow: מימוש עקרון ה-Actor - אם הלקוח כבר מטופל, המשימה הבאה מחכה בתור [cite: 200-205].",
+                25: "execute -> finally -> complete: מבנה קריטי! מבטיח שהלקוח ישוחרר גם אם הייתה שגיאה [cite: 228-229]."
+            }
+        };
+
+        const mainData = {
+            title: "Server & Main",
+            code: `public interface Server<T> extends Closeable {
+    void serve();
+
+    public static <T> Server<T> reactor(
+            int nthreads, int port,
+            Supplier<MessagingProtocol<T>> protocolFactory,
+            Supplier<MessageEncoderDecoder<T>> encoderDecoderFactory) {
+        return new Reactor<T>(nthreads, port, protocolFactory, encoderDecoderFactory);
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        Server<String> reactor = Server.reactor(
+            2, 7777, 
+            () -> new EchoProtocol(), 
+            () -> new LineMessageEncoderDecoder()
+        );
+        reactor.serve();
+    }
+}`,
+            comments: {
+                4: "שיטה סטטית ליצירת השרת - שימוש ב-Factory Pattern.",
+                14: "יצירת שרת עם 2 Threads לעיבוד ופורט 7777."
+            }
+        };
+
+        // --- VIEWS ---
+
+        const IntroView = ({ onStart }) => (
+            <div className="flex flex-col items-center justify-center h-full p-8 text-center animate-in">
+                <div className="bg-white p-6 rounded-full shadow-lg mb-8 border-4 border-rose-50 ring-8 ring-rose-50/50">
+                    <Icons.Heart className="w-12 h-12 text-rose-400 fill-rose-50" />
+                </div>
+                <h1 className="text-4xl font-black text-slate-800 mb-4 tracking-tight">סיכום Reactor למבחן</h1>
+                <p className="text-xl text-slate-600 max-w-2xl mb-2 font-light leading-relaxed">
+                    היי כולם! 👋 הכנתי את זה לעצמי כדי לעשות קצת סדר בראש ומקווה שיעזור גם לכם.
+                </p>
+                <p className="text-2xl font-bold text-indigo-600 mb-10">בהצלחה לכוולם במבחן! 3{'>'}</p>
+                <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-xl max-w-2xl w-full text-right mb-10">
+                    <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-700">
+                        <Icons.Info className="text-indigo-500 w-5 h-5"/> איך משתמשים?
+                    </h3>
+                    <ul className="space-y-4 text-slate-500 text-sm">
+                        <li className="flex items-start gap-3"><span className="bg-indigo-100 text-indigo-600 w-5 h-5 rounded-full flex items-center justify-center shrink-0 font-bold">1</span> עוברים בין הטאבים למעלה לכל חלקי הקוד מהנספח.</li>
+                        <li className="flex items-start gap-3"><span className="bg-indigo-100 text-indigo-600 w-5 h-5 rounded-full flex items-center justify-center shrink-0 font-bold">2</span> לוחצים על שורות קוד שיש לידן אייקון מידע כחול.</li>
+                        <li className="flex items-start gap-3"><span className="bg-indigo-100 text-indigo-600 w-5 h-5 rounded-full flex items-center justify-center shrink-0 font-bold">3</span> ההסבר הטכני יופיע מיידית בפאנל השמאלי.</li>
+                    </ul>
+                </div>
+                <button onClick={onStart} className="bg-slate-800 text-white px-12 py-5 rounded-2xl font-bold shadow-2xl hover:bg-slate-700 transition-all hover:-translate-y-1">
+                    בואו נתחיל
+                </button>
+            </div>
+        );
+
+        const SelectorDeepDive = () => (
+            <div className="p-10 h-full overflow-y-auto animate-in space-y-12" dir="rtl">
+                <h2 className="text-4xl font-black text-slate-800 flex items-center gap-4">
+                    <Icons.Eye className="w-10 h-10 text-indigo-600" /> הסלקטור (The Selector)
+                </h2>
+                <div className="grid md:grid-cols-2 gap-8">
+                    <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm relative overflow-hidden group">
+                        <div className="absolute top-0 right-0 w-2 h-full bg-indigo-500"></div>
+                        <h3 className="font-bold text-xl mb-4 text-indigo-700 font-heading">למה הוא המוח?</h3>
+                        <p className="text-slate-600 leading-relaxed text-lg font-light">
+                            הסלקטור הוא רכיב של ה-OS שמאפשר לנו לנטר אלפי חיבורים בבת אחת. במקום להחזיק Thread לכל לקוח (מה שיפיל את השרת), יש לנו שומר אחד שבודק את כולם.
+                        </p>
+                    </div>
+                    <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm relative overflow-hidden group">
+                        <div className="absolute top-0 right-0 w-2 h-full bg-emerald-500"></div>
+                        <h3 className="font-bold text-xl mb-4 text-emerald-700 font-heading">איך הוא עובד?</h3>
+                        <p className="text-slate-600 leading-relaxed text-lg font-light">
+                            אנחנו רושמים סוקטים אליו. הפקודה <code>select()</code> גורמת לשרת 'לישון' ומערכת ההפעלה מעירה אותו רק כשיש אירוע אמיתי (חיבור חדש או מידע שהגיע).
+                        </p>
+                    </div>
+                </div>
+                <div className="bg-slate-800 text-white p-10 rounded-[3rem] shadow-2xl relative overflow-hidden">
+                    <div className="relative z-10">
+                        <h3 className="text-2xl font-bold mb-6 text-indigo-300">הלוגיקה הקריטית של serve() </h3>
+                        <div className="grid md:grid-cols-3 gap-8">
+                            <div className="space-y-2">
+                                <div className="text-emerald-400 font-bold text-xl italic">1. select()</div>
+                                <p className="text-slate-400 text-sm">המתנה חכמה לאירוע רשת בלי לבזבז CPU.</p>
+                            </div>
+                            <div className="space-y-2">
+                                <div className="text-emerald-400 font-bold text-xl italic">2. handle</div>
+                                <p className="text-slate-400 text-sm">טיפול מהיר במפתחות שהשתנו (Selected Keys).</p>
+                            </div>
+                            <div className="space-y-2">
+                                <div className="text-rose-400 font-bold text-xl italic">3. clear()</div>
+                                <p className="text-slate-400 text-sm">ניקוי הרשימה כדי לא לטפל שוב באותו אירוע.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+            </div>
+        );
+
+        // --- MAIN APP ---
+
+        function App() {
+            const [activeTab, setActiveTab] = useState('Intro');
+            const [selectedLine, setSelectedLine] = useState(null);
+
+            const tabs = [
+                { id: 'Intro', label: 'התחלה', icon: <Icons.Heart /> },
+                { id: 'Selector', label: 'The Selector', icon: <Icons.Eye /> },
+                { id: 'Reactor', label: 'Reactor.java', data: reactorData, icon: <Icons.Cpu /> },
+                { id: 'Handler', label: 'Handler.java', data: handlerData, icon: <Icons.Code /> },
+                { id: 'Pool', label: 'ThreadPool.java', data: poolData, icon: <Icons.Layers /> },
+                { id: 'Main', label: 'Server & Main', data: mainData, icon: <Icons.Play /> }
+            ];
+
+            const currentTab = useMemo(() => tabs.find(t => t.id === activeTab), [activeTab]);
+
+            return (
+                <div className="flex flex-col h-screen overflow-hidden bg-slate-50">
+                    <header className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between z-20 shrink-0">
+                        <div className="flex items-center gap-4">
+                            <div className="bg-slate-800 p-2.5 rounded-2xl text-white shadow-lg"><Icons.Cpu className="w-6 h-6" /></div>
+                            <div>
+                                <h1 className="font-bold text-xl text-slate-800">Reactor Explainer</h1>
+                                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">SPL BGU • Eden Eitan</p>
+                            </div>
+                        </div>
+                    </header>
+
+                    <div className="flex-1 flex overflow-hidden">
+                        <nav className="w-72 bg-white border-r border-slate-200 flex flex-col p-6 gap-3 shrink-0 overflow-y-auto">
+                            {tabs.map(tab => (
+                                <button
+                                    key={tab.id}
+                                    onClick={() => { setActiveTab(tab.id); setSelectedLine(null); }}
+                                    className={`flex items-center gap-4 px-5 py-4 rounded-[1.25rem] text-sm font-bold transition-all
+                                        ${activeTab === tab.id ? 'bg-slate-800 text-white shadow-xl translate-x-1' : 'text-slate-500 hover:bg-slate-50'}`}
+                                >
+                                    <span className="w-5 h-5">{tab.icon}</span>
+                                    {tab.label}
+                                </button>
+                            ))}
+                        </nav>
+
+                        <main className="flex-1 flex overflow-hidden relative">
+                            {activeTab === 'Intro' ? (
+                                <div className="w-full h-full"><IntroView onStart={() => setActiveTab('Selector')} /></div>
+                            ) : activeTab === 'Selector' ? (
+                                <div className="w-full h-full"><SelectorDeepDive /></div>
+                            ) : (
+                                <>
+                                    <div className="flex-1 border-r border-slate-200 overflow-hidden bg-[#fafafa]">
+                                        <div className="font-mono text-[14px] leading-8 overflow-auto h-full p-8" dir="ltr">
+                                            <div className="pb-32">
+                                                {currentTab.data.code.split('\n').map((line, i) => {
+                                                    const lineNum = i + 1;
+                                                    const comment = currentTab.data.comments[lineNum];
+                                                    const isSelected = selectedLine === lineNum;
+                                                    return (
+                                                        <div 
+                                                            key={i}
+                                                            onClick={() => comment && setSelectedLine(lineNum)}
+                                                            className={`flex transition-all duration-300 cursor-pointer border-l-4
+                                                                ${isSelected ? 'bg-indigo-100/50 border-indigo-500 z-10 shadow-sm' : 'hover:bg-slate-200 border-transparent'}
+                                                                ${selectedLine && !isSelected ? 'opacity-30 blur-[0.4px]' : 'opacity-100'}
+                                                            `}
+                                                        >
+                                                            <span className={`w-14 text-right pr-4 text-xs select-none ${isSelected ? 'text-indigo-600 font-black' : 'text-slate-300'}`}>
+                                                                {lineNum}
+                                                            </span>
+                                                            <span className={`pl-4 flex-1 whitespace-pre pr-12 ${isSelected ? 'text-slate-900 font-medium' : 'text-slate-600'}`}>
+                                                                {line}
+                                                            </span>
+                                                            {comment && !isSelected && (
+                                                                <span className="absolute right-10 text-indigo-400 opacity-50"><Icons.Info className="w-5 h-5 mt-1.5" /></span>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="w-[28rem] bg-white p-10 flex flex-col gap-6 overflow-y-auto shrink-0 shadow-2xl z-10 border-r border-slate-100">
+                                        <div className="flex items-center gap-3 border-b pb-6 shrink-0">
+                                            <div className="bg-indigo-50 p-2 rounded-xl text-indigo-500"><Icons.Info className="w-5 h-5" /></div>
+                                            <h2 className="font-bold text-lg text-slate-800">ניתוח טכני</h2>
+                                        </div>
+                                        {selectedLine ? (
+                                            <div className="animate-in space-y-6">
+                                                <div className="bg-indigo-50 p-8 rounded-[2.5rem] border border-indigo-100 shadow-inner">
+                                                    <div className="text-[10px] text-indigo-400 font-black mb-3 uppercase tracking-widest font-mono">Line {selectedLine}</div>
+                                                    <p className="text-slate-700 leading-relaxed font-heading text-lg font-medium">
+                                                        {currentTab.data.comments[selectedLine]}
+                                                    </p>
+                                                </div>
+                                                <button onClick={() => setSelectedLine(null)} className="w-full py-4 text-sm text-indigo-600 font-bold border-2 border-dashed border-indigo-100 rounded-2xl hover:bg-indigo-50 transition-all">
+                                                    חזרה למבט מלא
+                                                </button>
+                                            </div>
+                                        ) : (
+                                            <div className="text-center mt-32 opacity-30 flex flex-col items-center">
+                                                <Icons.Code className="w-16 h-16 mb-4 text-slate-300" />
+                                                <p className="text-sm font-bold text-slate-500 leading-relaxed">לחצי על שורת קוד מודגשת <br/> כדי לראות את ההסבר שלה</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </>
+                            )}
+                        </main>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
